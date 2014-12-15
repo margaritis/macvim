@@ -498,6 +498,104 @@ slash_adjust(p)
     }
 }
 
+#if (defined(_MSC_VER) && (_MSC_VER >= 1300)) || defined(__MINGW32__)
+# define OPEN_OH_ARGTYPE intptr_t
+#else
+# define OPEN_OH_ARGTYPE long
+#endif
+
+    static int
+stat_symlink_aware(const char *name, struct stat *stp)
+{
+#if defined(_MSC_VER) && _MSC_VER < 1700
+    /* Work around for VC10 or earlier. stat() can't handle symlinks properly.
+     * VC9 or earlier: stat() doesn't support a symlink at all. It retrieves
+     * status of a symlink itself.
+     * VC10: stat() supports a symlink to a normal file, but it doesn't support
+     * a symlink to a directory (always returns an error). */
+    WIN32_FIND_DATA	findData;
+    HANDLE		hFind, h;
+    DWORD		attr = 0;
+    BOOL		is_symlink = FALSE;
+
+    hFind = FindFirstFile(name, &findData);
+    if (hFind != INVALID_HANDLE_VALUE)
+    {
+	attr = findData.dwFileAttributes;
+	if ((attr & FILE_ATTRIBUTE_REPARSE_POINT)
+		&& (findData.dwReserved0 == IO_REPARSE_TAG_SYMLINK))
+	    is_symlink = TRUE;
+	FindClose(hFind);
+    }
+    if (is_symlink)
+    {
+	h = CreateFile(name, FILE_READ_ATTRIBUTES,
+		FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+		OPEN_EXISTING,
+		(attr & FILE_ATTRIBUTE_DIRECTORY)
+					    ? FILE_FLAG_BACKUP_SEMANTICS : 0,
+		NULL);
+	if (h != INVALID_HANDLE_VALUE)
+	{
+	    int	    fd, n;
+
+	    fd = _open_osfhandle((OPEN_OH_ARGTYPE)h, _O_RDONLY);
+	    n = _fstat(fd, (struct _stat*)stp);
+	    _close(fd);
+	    return n;
+	}
+    }
+#endif
+    return stat(name, stp);
+}
+
+#ifdef FEAT_MBYTE
+    static int
+wstat_symlink_aware(const WCHAR *name, struct _stat *stp)
+{
+# if defined(_MSC_VER) && _MSC_VER < 1700
+    /* Work around for VC10 or earlier. _wstat() can't handle symlinks properly.
+     * VC9 or earlier: _wstat() doesn't support a symlink at all. It retrieves
+     * status of a symlink itself.
+     * VC10: _wstat() supports a symlink to a normal file, but it doesn't
+     * support a symlink to a directory (always returns an error). */
+    int			n;
+    BOOL		is_symlink = FALSE;
+    HANDLE		hFind, h;
+    DWORD		attr = 0;
+    WIN32_FIND_DATAW	findDataW;
+
+    hFind = FindFirstFileW(name, &findDataW);
+    if (hFind != INVALID_HANDLE_VALUE)
+    {
+	attr = findDataW.dwFileAttributes;
+	if ((attr & FILE_ATTRIBUTE_REPARSE_POINT)
+		&& (findDataW.dwReserved0 == IO_REPARSE_TAG_SYMLINK))
+	    is_symlink = TRUE;
+	FindClose(hFind);
+    }
+    if (is_symlink)
+    {
+	h = CreateFileW(name, FILE_READ_ATTRIBUTES,
+		FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+		OPEN_EXISTING,
+		(attr & FILE_ATTRIBUTE_DIRECTORY)
+					    ? FILE_FLAG_BACKUP_SEMANTICS : 0,
+		NULL);
+	if (h != INVALID_HANDLE_VALUE)
+	{
+	    int	    fd;
+
+	    fd = _open_osfhandle((OPEN_OH_ARGTYPE)h, _O_RDONLY);
+	    n = _fstat(fd, stp);
+	    _close(fd);
+	    return n;
+	}
+    }
+# endif
+    return _wstat(name, stp);
+}
+#endif
 
 /*
  * stat() can't handle a trailing '/' or '\', remove it first.
@@ -519,8 +617,22 @@ vim_stat(const char *name, struct stat *stp)
     p = buf + strlen(buf);
     if (p > buf)
 	mb_ptr_back(buf, p);
+
+    /* Remove trailing '\\' except root path. */
     if (p > buf && (*p == '\\' || *p == '/') && p[-1] != ':')
 	*p = NUL;
+
+    if ((buf[0] == '\\' && buf[1] == '\\') || (buf[0] == '/' && buf[1] == '/'))
+    {
+	/* UNC root path must be followed by '\\'. */
+	p = vim_strpbrk(buf + 2, "\\/");
+	if (p != NULL)
+	{
+	    p = vim_strpbrk(p + 1, "\\/");
+	    if (p == NULL)
+		STRCAT(buf, "\\");
+	}
+    }
 #ifdef FEAT_MBYTE
     if (enc_codepage >= 0 && (int)GetACP() != enc_codepage
 # ifdef __BORLANDC__
@@ -534,9 +646,9 @@ vim_stat(const char *name, struct stat *stp)
 
 	if (wp != NULL)
 	{
-	    n = _wstat(wp, (struct _stat *)stp);
+	    n = wstat_symlink_aware(wp, (struct _stat *)stp);
 	    vim_free(wp);
-	    if (n >= 0)
+	    if (n >= 0 || g_PlatformId == VER_PLATFORM_WIN32_NT)
 		return n;
 	    /* Retry with non-wide function (for Windows 98). Can't use
 	     * GetLastError() here and it's unclear what errno gets set to if
@@ -544,7 +656,7 @@ vim_stat(const char *name, struct stat *stp)
 	}
     }
 #endif
-    return stat(buf, stp);
+    return stat_symlink_aware(buf, stp);
 }
 
 #if defined(FEAT_GUI_MSWIN) || defined(PROTO)
@@ -703,8 +815,8 @@ mch_chdir(char *path)
 	{
 	    n = _wchdir(p);
 	    vim_free(p);
-	    if (n == 0)
-		return 0;
+	    if (n == 0 || g_PlatformId == VER_PLATFORM_WIN32_NT)
+		return n;
 	    /* Retry with non-wide function (for Windows 98). */
 	}
     }
@@ -1830,8 +1942,7 @@ mch_resolve_shortcut(char_u *fname)
 
 shortcut_errorw:
 		vim_free(p);
-		if (hr == S_OK)
-		    goto shortcut_end;
+		goto shortcut_end;
 	    }
 	}
 	/* Retry with non-wide function (for Windows 98). */
@@ -2756,12 +2867,27 @@ get_logfont(
 {
     char_u	*p;
     int		i;
+    int		ret = FAIL;
     static LOGFONT *lastlf = NULL;
+#ifdef FEAT_MBYTE
+    char_u	*acpname = NULL;
+#endif
 
     *lf = s_lfDefault;
     if (name == NULL)
 	return OK;
 
+#ifdef FEAT_MBYTE
+    /* Convert 'name' from 'encoding' to the current codepage, because
+     * lf->lfFaceName uses the current codepage.
+     * TODO: Use Wide APIs instead of ANSI APIs. */
+    if (enc_codepage >= 0 && (int)GetACP() != enc_codepage)
+    {
+	int	len;
+	enc_to_acp(name, (int)strlen(name), &acpname, &len);
+	name = acpname;
+    }
+#endif
     if (STRCMP(name, "*") == 0)
     {
 #if defined(FEAT_GUI_W32)
@@ -2776,10 +2902,9 @@ get_logfont(
 	cf.lpLogFont = lf;
 	cf.nFontType = 0 ; //REGULAR_FONTTYPE;
 	if (ChooseFont(&cf))
-	    goto theend;
-#else
-	return FAIL;
+	    ret = OK;
 #endif
+	goto theend;
     }
 
     /*
@@ -2788,7 +2913,7 @@ get_logfont(
     for (p = name; *p && *p != ':'; p++)
     {
 	if (p - name + 1 > LF_FACESIZE)
-	    return FAIL;			/* Name too long */
+	    goto theend;			/* Name too long */
 	lf->lfFaceName[p - name] = *p;
     }
     if (p != name)
@@ -2816,7 +2941,7 @@ get_logfont(
 		did_replace = TRUE;
 	    }
 	if (!did_replace || init_logfont(lf) == FAIL)
-	    return FAIL;
+	    goto theend;
     }
 
     while (*p == ':')
@@ -2877,25 +3002,27 @@ get_logfont(
 			    p[-1], name);
 		    EMSG(IObuff);
 		}
-		return FAIL;
+		goto theend;
 	}
 	while (*p == ':')
 	    p++;
     }
+    ret = OK;
 
-#if defined(FEAT_GUI_W32)
 theend:
-#endif
     /* ron: init lastlf */
-    if (printer_dc == NULL)
+    if (ret == OK && printer_dc == NULL)
     {
 	vim_free(lastlf);
 	lastlf = (LOGFONT *)alloc(sizeof(LOGFONT));
 	if (lastlf != NULL)
 	    mch_memmove(lastlf, lf, sizeof(LOGFONT));
     }
+#ifdef FEAT_MBYTE
+    vim_free(acpname);
+#endif
 
-    return OK;
+    return ret;
 }
 
 #endif /* defined(FEAT_GUI) || defined(FEAT_PRINTER) */
